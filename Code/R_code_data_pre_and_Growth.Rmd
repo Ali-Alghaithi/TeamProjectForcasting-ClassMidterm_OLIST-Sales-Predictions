@@ -1,0 +1,588 @@
+---
+title: "BF_Midterm_OLIST.Rcode"
+author: "Ali Alghaithi"
+date: "10/4/2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, results="hide",warning=FALSE, message=FALSE, include=FALSE}
+library(lubridate)
+library(forecast)
+library(tidyverse)
+library(fable)
+library(tsibble)
+library(fabletools)
+library(feasts)
+library(rstan)
+library(prophet)
+library(ggplot2)
+library(ggfortify)
+library(aTSA)
+```
+# Reading the data
+
+```{r}
+ord_df <- read.csv("/Users/alialghaithi/Box/BF_Class/BF_Midterm/olist_orders_dataset.csv", header=TRUE)
+oi_df <- read.csv("/Users/alialghaithi/Box/BF_Class/BF_Midterm/olist_order_items_dataset.csv", header=TRUE)
+itm_df <- read.csv("/Users/alialghaithi/Box/BF_Class/BF_Midterm/olist_products_dataset.csv", header=TRUE)
+itm_eng_df <- read.csv("/Users/alialghaithi/Box/BF_Class/BF_Midterm/product_category_name_translation.csv", header=TRUE)
+```
+
+
+```{r}
+head(ord_df)
+head(oi_df)
+head(itm_df)
+head(itm_eng_df)
+```
+
+
+
+# Merging The data
+```{r}
+product_complete <- left_join(itm_df, itm_eng_df, by = "product_category_name", copy = FALSE)
+items_df <- 
+  product_complete  %>% dplyr::select(product_id,
+           product_category_name,
+           product_category_name_english) %>%
+               mutate(product_category_name_english =ifelse(is.null(product_category_name_english) 
+                                                            & product_category_name == "pc_gamer","pc_gamer",
+                                                      ifelse(is.null(product_category_name_english) 
+                                                             & product_category_name != "pc_gamer","portable_mixer",
+                                                             product_category_name_english)
+                                                      )) %>%
+                                                      dplyr::select(product_id,product_category_name_english)
+  
+
+```
+
+
+Now, let's create the master datafile as a combination of all 3 tables (ord_df, oi_df, and items_df)
+```{r, warning=FALSE, message=FALSE}
+order <- dplyr::select(ord_df, c(order_id,order_purchase_timestamp)) %>%
+          mutate(order_purchase_timestamp=as.Date(order_purchase_timestamp))
+
+order <- order[order$order_purchase_timestamp >= as.Date('2017-01-01') & order$order_purchase_timestamp < as.Date('2018-08-01'),]
+
+orderitem <- oi_df %>%
+              dplyr::select(order_id,order_item_id,product_id,price) %>%
+              mutate(total_price = order_item_id*price,
+                     qty  = order_item_id) %>% dplyr::select(-order_item_id)
+master_df <- inner_join(inner_join(order,orderitem, by = "order_id", copy = FALSE),items_df, by = "product_id", copy = FALSE)
+tail(master_df,5)
+
+#write.csv(master_df, file="master_df.csv", row.names = FALSE, quote=FALSE)
+
+```
+
+
+
+```{r, warning=FALSE, message=FALSE}
+tsdf <- master_df %>% 
+            group_by(order_purchase_timestamp,product_category_name_english) %>%
+            summarise(sales_volume = sum(qty),
+                      revenue = sum(total_price))
+
+
+
+top_sales <- tsdf %>% group_by(product_category_name_english) %>% 
+              summarise(sales_volume = sum(sales_volume)) %>%  arrange(desc(sales_volume)) %>% 
+                    mutate(cummulative_sales = cumsum(sales_volume)/sum(tsdf$sales_volume))
+
+
+top_rev <- tsdf %>% group_by(product_category_name_english) %>% 
+              summarise(revenue = sum(revenue)) %>%  arrange(desc(revenue)) %>% 
+                    mutate(cummulative_revenue = cumsum(revenue)/sum(tsdf$revenue))
+
+
+
+top80sales <- top_sales[top_sales$cummulative_sales <= .50,] %>% arrange(cummulative_sales)
+
+top80revenue <- top_rev[top_rev$cummulative_revenue <= .50,]
+
+
+ggplot(top80sales, aes(x=reorder(product_category_name_english,-cummulative_sales))) +
+  geom_bar(aes(y=sales_volume), fill='#e80738', stat="identity") +
+  theme(axis.text.x = element_text(angle=90, vjust=0.6)) +
+  labs(title = "Top 50% Cummulative Sales", subtitle = "Sales Volume by Product Category"
+       , x = 'Product Category', y ='Sales (in Units)') + coord_flip()
+
+
+
+ggplot(top80revenue, aes(x=reorder(product_category_name_english,-cummulative_revenue))) +
+  geom_bar(aes(y=revenue/10000), fill='#213ee2', stat="identity") +
+  theme(axis.text.x = element_text(angle=90, vjust=0.6)) +
+  labs(title = "Top 50% Cummulative Revenue", subtitle = "Revenue by Product Category", 
+       x = 'Product Category', y ='Revenue "in 10K"')+  coord_flip()
+       
+```
+
+# Looking at the overall time series trend
+
+```{r , warning=FALSE, message=FALSE}
+tsdf2 <- master_df  %>% group_by(order_purchase_timestamp) %>% 
+                summarise(sales_volume = sum(qty))
+
+
+tsdf2
+#ts(tsdf2$sales_volume, start = c(2016, 9, 4)) %>% autoplot()
+p <- ggplot(tsdf2, aes(x=order_purchase_timestamp, y=sales_volume)) +
+  geom_line(color = "#213ee2") + 
+  ggtitle("Sales Volume (2017 to 2018)") +
+  theme(plot.title = element_text(size = 22, face = "bold"))
+
+p
+
+```
+
+
+
+
+```{r, warning=FALSE}
+
+dc1_classical_add <- decompose(ts(tsdf2$sales_volume, frequency = 7), type = "additive")
+autoplot(dc1_classical_add) +
+  ggtitle("Top 80% Sales Volume Classical Additive Decomposition") + 
+  xlab("order_purchase_timestamp")
+```
+
+
+
+
+# Time Series for Top 80% Sales Product Categories
+
+Let's zoom in on the time series a little bit to see the jump in black friday more closely based on each product category.
+Below is the time series plot for the top 3 product category. As we can see below, each product categories have different seasonality and they have different peak effect. With this analysis, I decided to do a bottom up forecast, meaning that I will create different models per each product category and sum it up at the end for the overall forecast. As for the items in each product category, I will allocate the forecast based on the their % of sales within the category, this is due to the idea that each product within the same category will more or less follow the same seasonality and trend.
+
+For this analysis, I will focus only on the product categories that make up the top 80% Sales (~6.8M in Average Annual Revenue). 
+```{r}
+tsdftemp <- tsdf[tsdf$product_category_name_english %in% top80sales$product_category_name_english,] 
+tmp1 <- tsdftemp %>% group_by(order_purchase_timestamp) %>% summarise(revenue = sum(revenue))
+sum(tmp1$revenue)/nrow(tmp1)*365
+```
+
+```{r}
+tsdf2 <- tsdf[tsdf$product_category_name_english %in% c("bed_bath_table","furniture_decor","health_beauty"),]
+#"bed_bath_table","furniture_decor","health_beauty"
+
+tsdf2
+p <- ggplot(tsdf2, aes(x=order_purchase_timestamp, y=sales_volume, color = product_category_name_english)) +
+  geom_line() + 
+  ggtitle("Sales Volume from Jan 2017 to August 2018") +
+  scale_x_date(date_labels = "%m-%Y") +
+  scale_color_manual(values=c("red", "green","blue")) +
+  theme(plot.title = element_text(size = 22, face = "bold"))
+p
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+tsdf80 <- tsdf
+tsdf80f <- tsdf80 %>% mutate(dow = wday(order_purchase_timestamp, label=TRUE),
+                             month = month(order_purchase_timestamp, label=TRUE),
+                              day = day(order_purchase_timestamp)) 
+monthtemp <- tsdf80f %>% group_by(month) %>% summarise(sales_volume= sum(sales_volume)) 
+temp <- tsdf80f %>% group_by(dow) %>% summarise(sales_volume= sum(sales_volume)) 
+temp$dow <- ordered(temp$dow, levels=c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"))
+
+daytemp <- tsdf80f %>% group_by(day) %>% summarise(sales_volume= sum(sales_volume)) 
+
+
+
+
+ggplot(monthtemp, aes(x=month, y=sales_volume, group = 1)) +
+  geom_line(color = "#213ee2",size=1.5) + 
+  geom_point(color = "#06d997",size=5)+
+  ggtitle("Yearly Trend") +
+  theme(plot.title = element_text(size = 22, face = "bold"))
+
+
+
+ggplot(daytemp, aes(x=day, y=sales_volume, group = 1)) +
+  geom_line(color = "#043e83",size=1) + 
+  geom_point(color = "#a49cf8",size=4)+
+  ggtitle("Monthly Trend") +
+  theme(plot.title = element_text(size = 22, face = "bold"))
+
+
+
+ggplot(temp, aes(x=dow, y=sales_volume,fill=dow)) +
+  geom_bar(position="dodge", stat="identity") + 
+  ggtitle("Weekly Trend") +
+  scale_fill_manual(values=c("#213ee2","#a49cf8","#5071dd","#88b0e4","#06d997","#046a41","#043e83")) +
+  theme(plot.title = element_text(size = 22, face = "bold"))
+```
+
+
+
+## Arima, Sarima, Sarimax
+
+```{r, message=FALSE}
+#PACF & ACF showing so many lags correlated with the last values -->  Need to make data stationary
+tsreg <- tsdf80f %>% group_by(order_purchase_timestamp) %>% summarise(sales_volume=sum(sales_volume))
+tsdf80f
+
+
+tsregts <-  ts(tsreg$sales_volume, frequency = 7)
+autoplot(tsregts, ts.colour = "#213ee2") 
+Acf(tsregts, lag=60)
+Pacf(tsregts, lag=60)
+#using diff to make data stationary --> already looking much better
+tsdiff <- tsdf80f %>% group_by(order_purchase_timestamp) %>% summarise(sales_volume=sum(sales_volume))
+tsdiffts <-  ts(tsdiff$sales_volume, frequency = 7)
+diff1 <- diff(tsdiffts, differences = 7)
+autoplot(diff1, ts.colour = "#213ee2") 
+Acf(diff1, lag=60)
+Pacf(diff1, lag=60)
+adf.test(diff1, nlag = 1)
+```
+
+- ## Training Arima Model
+
+# based on : https://www.timeanddate.com/holidays/brazil/2018
+```{r, warning = FALSE, message = FALSE}
+tsdf80f
+
+tempdf <- tsdf80f %>% group_by(order_purchase_timestamp,day,month,dow) %>% summarise(sales_volume=sum(sales_volume))
+#adding the holiday calendar information
+tempdf
+
+library(readxl)
+hldy <- read_excel("/Users/alialghaithi/Box/BF_Class/BF_Midterm/Vacations.xlsx") %>% mutate(date = as.Date(Date), format = "%m/%d/%y")
+
+month <- as.character(tempdf$month)
+dow <- as.character(tempdf$dow)
+monthdum <- as.data.frame(model.matrix(~month-1))[,2:12]
+dowdum <-as.data.frame(model.matrix(~dow-1))[,2:7]
+tempdf <- tempdf %>% mutate(weekday =  ifelse(as.character( wday(order_purchase_timestamp, label=TRUE)) %in% c("Sun","Sat"), 0,1))
+tempdf1 <- cbind(tempdf,monthdum,dowdum)
+
+tempdf1
+hldy$Date
+library(dplyr)
+#merging the holiday information to the ts dataframe
+merged_df <- left_join(tempdf1, hldy, by = c("order_purchase_timestamp"="date"), copy = FALSE)
+merged_df['holiday']<- ifelse(is.na(merged_df$Date),0,1)
+#merged_df <- merged_df %>% select(-merged_df$Date)
+merged_df$product_category <- "all"
+alltsb <- as_tsibble(merged_df, index = order_purchase_timestamp, key = product_category)
+train <- merged_df %>% filter(order_purchase_timestamp < '2018-05-01')
+test <- merged_df %>% filter(order_purchase_timestamp >= '2018-05-01')
+traintsb <- as_tsibble(train, index = order_purchase_timestamp, key = product_category)
+testtsb <- as_tsibble(test, index = order_purchase_timestamp, key = product_category)
+testtsb
+
+```
+
+
+
+### Analyzing individual models
+
+```{r}
+require(prophet)
+
+traints <- ts(train$sales_volume, frequency = 7)
+testts <- ts(test$sales_volume, frequency = 7)
+ar_man <- arima(traints, order=c(4,1,2), seasonal= list(order=c(0,1,2), period=7))
+ar_au <- auto.arima(traints)
+ar_man
+ar_au
+print("Tuned Arima")
+#summary(ar_man)
+Box.test(residuals(ar_man))
+print("Auto Arima")
+summary(ar_au)
+Box.test(residuals(ar_au))
+checkresiduals((ar_man))
+
+
+ar_au
+```
+
+
+
+
+# Combining models  
+```{r, warning=FALSE}
+fit <- traintsb[,-c(24,25)]%>% 
+        model(sarima1 = ARIMA(sales_volume ~ 0 + pdq(1, 1, 2) + PDQ(0, 1, 1, period = 7)),
+              sarima2 = ARIMA(sales_volume ~ 0 + pdq(1, 1, 1) + PDQ(0, 1, 1, period = 7)),
+              sarima3 = ARIMA(sales_volume ~ 0 + pdq(4, 1, 2) + PDQ(0, 1, 1, period = 7)),
+              sarimax =  ARIMA(sales_volume ~ month + weekday  + day + trend() + fourier(period = "week",1)+
+                                fourier(period = "month",3) + fourier(period = "year",5)),
+              tslm = TSLM(sales_volume ~ month + trend() + season("week") + fourier(period = "month",3)))
+fit %>% report()
+```
+
+```{r, warning=FALSE, message=FALSE}
+#forecasting
+val_days <- nrow(testtsb[,-c(24,25)])
+fc <- fit %>% predict(testtsb[,-c(24,25)])
+
+x <- fc %>% accuracy(testtsb[,-c(24,25)])
+
+(x$RMSE)^2
+fc %>% 
+  autoplot(alltsb, level =NULL) +
+  ggtitle("Forecasts  for May,June, and July") +
+  xlab("date") +
+  guides(colour = guide_legend(title = "Forecast"))
+
+
+
+````
+
+
+
+
+```{r}
+# modeling the Whole Data
+alltsb
+fit.all <- alltsb[,-c(24,25)]%>% 
+        model(sarima = ARIMA(sales_volume ~ 0 + pdq(4, 1, 2) + PDQ(0, 1, 1, period = 7)),
+              sarima2 = ARIMA(sales_volume ~ 0 + pdq(1, 1, 1) + PDQ(0, 1, 1, period = 7)),
+              sarima3 = ARIMA(sales_volume ~ 0 + pdq(4, 1, 2) + PDQ(0, 1, 1, period = 7)),
+              sarimax =  ARIMA(sales_volume ~ month + weekday  + day + trend() + fourier(period = "week",1)+
+                                fourier(period = "month",3) + fourier(period = "year",5)),
+              tslm = TSLM(sales_volume ~ month + trend() + season("week") + fourier(period = "month",3)))
+fit.all %>% report()
+
+```
+
+
+
+
+
+
+
+
+# creating nest dara for forcasting
+
+```{r}
+values = seq(from = as.Date("2018-08-01"), to = as.Date("2018-10-31"), by = 'day')
+values<- as.data.frame(values) 
+
+
+
+TEST<- values %>% mutate(dow = wday(values, label=TRUE),
+                             month = month(values, label=TRUE),
+                              day = day(values)) 
+
+month <- as.character(TEST$month)
+dow <- as.character(TEST$dow)
+monthdum <- as.data.frame(model.matrix(~month-1))
+dowdum <-as.data.frame(model.matrix(~dow-1))
+
+tempdf <- TEST %>% mutate(weekday =  ifelse(as.character( wday(values, label=TRUE)) %in% c("Sun","Sat"), 0,1))
+tempdf1 <- cbind(tempdf,monthdum,dowdum)
+tempdf1
+
+tempdf1$sales_volume<- 0
+
+#rownames(tempdf1) <- NULL
+
+tempdf1$product_category <- "all"
+final.test_data<-as_tsibble(tempdf1, index = values, key = product_category)
+testtsb
+tempdf111
+
+fc <- fit.all %>% predict(final.test_data)
+fc %>% 
+  autoplot(final.test_data, level =NULL) +
+  ggtitle("Forecasts for Aug,Sep, and Oct") +
+  xlab("Year 2018") +
+  guides(colour = guide_legend(title = "Forecast"))
+
+
+
+```
+
+
+
+
+# Goal 3:  modling train and test data
+
+```{r}
+
+library(readr)
+construction_tools_lights_data <- read_csv("Box/BF_Class/BF_Midterm/construction_tools_lights_data.csv")
+construction_tools_lights_data
+
+construction<- construction_tools_lights_data %>% mutate(dow = wday(order_purchase_timestamp, label=TRUE),
+                             month = month(order_purchase_timestamp, label=TRUE),
+                              day = day(order_purchase_timestamp)) 
+construction
+
+month <- as.character(construction$month)
+dow <- as.character(construction$dow)
+
+
+tempdf <- construction %>% mutate(weekday =  ifelse(as.character( wday(order_purchase_timestamp, label=TRUE)) %in% c("Sun","Sat"), 0,1))
+
+
+
+alltsb <- as_tsibble(tempdf, index = order_purchase_timestamp, key = product_category_name_english)
+train <- tempdf %>% filter(order_purchase_timestamp < '2018-05-01')
+test <- tempdf %>% filter(order_purchase_timestamp >= '2018-05-01')
+traintsb <- as_tsibble(train, index = order_purchase_timestamp, key = product_category_name_english)
+testtsb <- as_tsibble(test, index = order_purchase_timestamp, key = product_category_name_english)
+
+
+
+fit.construction <- traintsb%>% 
+        model(tslm = TSLM(sales_volume ~ month + trend() + season("week") + fourier(period = "month",3)))
+fit.construction %>% report()
+
+
+#forecasting
+val_days <- nrow(testtsb)
+fc <- fit.construction %>% predict(testtsb)
+
+x <- fc %>% accuracy(testtsb)
+
+
+fc %>% 
+  autoplot(alltsb, level =NULL) +
+  ggtitle("Forecasts  for May,June, and July") +
+  xlab("date") +
+  guides(colour = guide_legend(title = "Forecast"))
+
+
+# =====================================================================================================
+# whole_data model modeling fit and forcasting 
+
+fit.construction.all <- alltsb%>% 
+        model(
+              tslm = TSLM(sales_volume ~ month + trend() + season("week") + fourier(period = "month",3)))
+fit.construction.all %>% report()
+
+
+
+values = seq(from = as.Date("2018-08-01"), to = as.Date("2018-10-31"), by = 'day')
+values<- as.data.frame(values) 
+
+
+
+TEST<- values %>% mutate(dow = wday(values, label=TRUE),
+                             month = month(values, label=TRUE),
+                              day = day(values)) 
+
+month <- as.character(TEST$month)
+dow <- as.character(TEST$dow)
+monthdum <- as.data.frame(model.matrix(~month-1))
+dowdum <-as.data.frame(model.matrix(~dow-1))
+
+tempdf <- TEST %>% mutate(weekday =  ifelse(as.character( wday(values, label=TRUE)) %in% c("Sun","Sat"), 0,1))
+tempdf1 <- cbind(tempdf,monthdum,dowdum)
+tempdf1
+
+tempdf1$sales_volume<- 0
+
+#rownames(tempdf1) <- NULL
+
+tempdf1$product_category_name_english <- "construction_tools_lights"
+final.test_data<-as_tsibble(tempdf1, index = values, key = product_category_name_english)
+
+
+
+summary(final.test_data)
+
+final.test_data
+testtsb
+# forCast all #forecasting
+val_days <- nrow(testtsb)
+fc <- fit.construction.all %>% predict(final.test_data)
+
+ fc$.mean <-  ifelse(fc$.mean < 0, 0,fc$.mean)
+ fc$.mean
+fc
+fc %>% 
+  autoplot(final.test_data, level =NULL) +
+  ggtitle("Forecasts  for May,June, and July") +
+  xlab("date") +
+  guides(colour = guide_legend(title = "Forecast"))
+
+plot(final.test_data$values, fc$.mean,type="line")
+
+
+# total sales  from forcasting 
+
+sum(fc$.mean)
+
+```
+
+
+
+
+
+
+
+
+
+
+# Claculating growth
+```{r}
+
+
+m1<- m %>% filter(as.integer(year)==2017 &  month %in% c("May","Jun","Jul")) %>% group_by(product_category_name_english) %>% summarise(sales_volume_2017=sum(sales_volume)) %>% filter(sales_volume_2017 > 100)
+
+
+m2<- m %>% filter(as.integer(year)==2018 &  month %in% c("May","Jun","Jul")) %>% group_by(product_category_name_english) %>% summarise(sales_volume_2018=sum(sales_volume)) #%>%  filter(sales_volume_2018 > 100)
+
+
+total <- merge(m1,m2,by="product_category_name_english")
+total$growth_rate <-  ((total$sales_volume_2018 -total$sales_volume_2017)/total$sales_volume_2017)
+
+total %>% arrange(desc(growth_rate))
+
+
+# After forcasts
+
+#bed_bath_table  growth 
+ bed_bath_table_growth <- m %>% filter(as.integer(year)==2017 &  month %in% c("Aug", "Sep", "Oct") & 
+                product_category_name_english == "bed_bath_table") %>% 
+   group_by(product_category_name_english) %>%summarise(sales_volume_2017=sum(sales_volume))
+
+ bed_bath_table_growth$sales_volume_2018 = 3713
+bed_bath_table_growth$growth_rate <-  ((bed_bath_table_growth$sales_volume_2018 -bed_bath_table_growth$sales_volume_2017)/bed_bath_table_growth$sales_volume_2017)
+bed_bath_table_growth
+
+
+#furniture_decor growth 
+ furniture_decor_growth <- m %>% filter(as.integer(year)==2017 &  month %in% c("Aug", "Sep", "Oct") & 
+                product_category_name_english == "furniture_decor") %>% 
+   group_by(product_category_name_english) %>%summarise(sales_volume_2017=sum(sales_volume))
+
+ furniture_decor_growth$sales_volume_2018 = 2737
+furniture_decor_growth$growth_rate <-  ((furniture_decor_growth$sales_volume_2018 -furniture_decor_growth$sales_volume_2017)/furniture_decor_growth$sales_volume_2017)
+furniture_decor_growth
+
+
+#health_beauty  growth 
+ health_beauty_growth <- m %>% filter(as.integer(year)==2017 &  month %in% c("Aug", "Sep", "Oct") & 
+                product_category_name_english == "health_beauty") %>% 
+   group_by(product_category_name_english) %>%summarise(sales_volume_2017=sum(sales_volume))
+
+ health_beauty_growth$sales_volume_2018 = 2871
+health_beauty_growth$growth_rate <-  ((health_beauty_growth$sales_volume_2018 -health_beauty_growth$sales_volume_2017)/health_beauty_growth$sales_volume_2017)
+health_beauty_growth
+
+#construction_tools_lights_growth 
+
+construction_tools_lights_growth <- m %>% filter(as.integer(year)==2017 &  month %in% c("Aug", "Sep", "Oct") & 
+                product_category_name_english == "construction_tools_lights") %>% 
+   group_by(product_category_name_english) %>%summarise(sales_volume_2017=sum(sales_volume))
+
+ construction_tools_lights_growth$sales_volume_2018 = 361.0567
+
+
+ construction_tools_lights_growth$growth_rate <-  ((construction_tools_lights_growth$sales_volume_2018 -construction_tools_lights_growth$sales_volume_2017)/construction_tools_lights_growth$sales_volume_2017)
+construction_tools_lights_growth
+```
+
+
+```
